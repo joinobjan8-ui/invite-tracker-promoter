@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: promoter-invite-tracker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROUP_ID
+        value: "@Promoter0007"
+      - key: MONGODB_URI
+        sync: false
+      - key: DB_NAME
+        value: promoter_giveaway
+      - key: WEBHOOK_SECRET
+        generateValue: true
