@@ -1,3 +1,4 @@
+
 services:
   - type: web
     name: promoter-invite-tracker
@@ -7,6 +8,8 @@ services:
     startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
     healthCheckPath: /
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.4
       - key: BOT_TOKEN
         sync: false
       - key: GROUP_ID
