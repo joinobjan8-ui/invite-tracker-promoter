@@ -40,9 +40,9 @@ if db is not None:
     db.invite_links.create_index(
         [("chat_id", ASCENDING), ("inviter_id", ASCENDING)], unique=True
     )
-    db.invite_links.create_index(
-        [("chat_id", ASCENDING), ("invite_link", ASCENDING)]
-    )
+    # The existing Atlas database already has a unique index on
+    # (chat_id, invite_link). Do not recreate it as a non-unique index,
+    # which causes IndexKeySpecsConflict and prevents Gunicorn from booting.
     db.referrals.create_index(
         [("chat_id", ASCENDING), ("referred_id", ASCENDING)], unique=True
     )
