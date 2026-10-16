@@ -1,6 +1,7 @@
 
 import os
 import logging
+from html import escape
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
@@ -371,23 +372,50 @@ def handle_message(message):
         send(chat_id, "\n".join(lines))
 
 
+def welcome_new_member(chat_id, user):
+    """Post a short public welcome and giveaway CTA, mentioning the joiner."""
+    user_id = user.get("id")
+    if not user_id:
+        return
+
+    display_name = escape(str(user.get("first_name") or "friend"))
+    mention = f'<a href="tg://user?id={int(user_id)}">{display_name}</a>'
+    message = (
+        f"🎉 Welcome to <b>PROMOTER</b>, {mention}! 🚀\n\n"
+        "💎 <b>500 TON GIVEAWAY • 100 WINNERS</b> 🏆\n"
+        "Invite genuine friends to compete for prizes!\n\n"
+        "👇 Type <code>/mylink</code> in this group to get started."
+    )
+    send(chat_id, message, parse_mode="HTML")
+
+
 def handle_chat_member(update):
     chat = update.get("chat", {})
-
-    if not is_target_chat(chat) or db is None:
+    if not is_target_chat(chat):
         return
 
     old = update.get("old_chat_member", {})
     new = update.get("new_chat_member", {})
 
-    # Only count a transition from non-member to member.
+    # Trigger only when someone transitions from non-member to member.
     if is_member_status(old) or not is_member_status(new):
         return
 
     joined = new.get("user", {})
+
+    # Public group welcome works even if MongoDB is temporarily unavailable.
+    try:
+        welcome_new_member(chat.get("id"), joined)
+    except Exception:
+        log.exception("Could not send new-member welcome message")
+
+    # Referral tracking requires MongoDB and a tracked personal invite link.
+    if db is None:
+        log.warning("MongoDB is not configured; skipping referral tracking")
+        return
+
     invite = update.get("invite_link") or {}
     link = invite.get("invite_link")
-
     if not joined.get("id") or not link:
         return
 
@@ -395,15 +423,12 @@ def handle_chat_member(update):
         "chat_id": str(GROUP_ID),
         "invite_link": link,
     })
-
     if not record:
         log.info("Join used an untracked invite link.")
         return
 
     inviter_id = int(record["inviter_id"])
     referred_id = int(joined["id"])
-
-    # Never count self-referrals.
     if inviter_id == referred_id:
         return
 
@@ -411,9 +436,7 @@ def handle_chat_member(update):
         db.referrals.insert_one({
             "chat_id": str(GROUP_ID),
             "inviter_id": inviter_id,
-            "inviter_name": record.get(
-                "inviter_name", str(inviter_id)
-            ),
+            "inviter_name": record.get("inviter_name", str(inviter_id)),
             "referred_id": referred_id,
             "referred_name": (
                 joined.get("username")
@@ -423,13 +446,7 @@ def handle_chat_member(update):
             "invite_link": link,
             "joined_at": datetime.now(timezone.utc),
         })
-
-        log.info(
-            "Tracked referral: inviter=%s joined=%s",
-            inviter_id,
-            referred_id,
-        )
-
+        log.info("Tracked referral: inviter=%s joined=%s", inviter_id, referred_id)
     except Exception as exc:
         if exc.__class__.__name__ != "DuplicateKeyError":
             log.exception("Could not save referral")
