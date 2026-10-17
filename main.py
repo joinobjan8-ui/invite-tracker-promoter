@@ -3,6 +3,8 @@ import logging
 from html import escape
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 
 from flask import Flask, request, jsonify
 import requests
@@ -378,12 +380,98 @@ def handle_chat_member(update):
             log.exception("Could not save referral")
 
 
+
+def reminder_keyboard():
+    # Tapping this button runs the bot callback for the tapping user.
+    return {
+        "inline_keyboard": [[
+            {"text": "/mylink", "callback_data": "generate_mylink"}
+        ]]
+    }
+
+
+def send_mylink_reminder():
+    """Post a group reminder with a clickable /mylink button every 30 seconds."""
+    while True:
+        time.sleep(30)
+        try:
+            if not GROUP_ID:
+                log.error("GROUP_ID is empty; skipping /mylink reminder")
+                continue
+            send(
+                GROUP_ID,
+                "🚀 <b>PROMOTER 500 TON GIVEAWAY</b>\n"
+                "💎 Invite genuine friends and compete for prizes!\n"
+                "👇 Tap <b>/mylink</b> below to generate your personal invite link.",
+                parse_mode="HTML",
+                reply_markup=reminder_keyboard(),
+            )
+        except Exception:
+            log.exception("Could not send 30-second /mylink reminder")
+
+
+def handle_callback_query(callback):
+    data = callback.get("data", "")
+    user = callback.get("from", {})
+    callback_id = callback.get("id", "")
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+
+    if data != "generate_mylink":
+        if callback_id:
+            tg("answerCallbackQuery", {
+                "callback_query_id": callback_id,
+                "text": "Unknown action.",
+                "show_alert": False,
+            })
+        return
+
+    if not user.get("id"):
+        return
+
+    try:
+        tg("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "Generating your personal invite link…",
+            "show_alert": False,
+        })
+    except Exception:
+        log.exception("Could not answer callback query")
+
+    # The clicked user's Telegram identity is used, so each user gets their own link.
+    link, error = make_invite_link(user)
+    if error:
+        send(
+            chat.get("id", GROUP_ID),
+            f"❌ Could not create a link for {escape(str(user.get('first_name') or 'this user'))}. "
+            "Please check the bot's Manage Invite Links permission.",
+            reply_to_message_id=message.get("message_id"),
+        )
+        return
+
+    username = user.get("username")
+    if username:
+        mention = f'<a href="https://t.me/{escape(username, quote=True)}">@{escape(username)}</a>'
+    else:
+        mention = f'<a href="tg://user?id={int(user["id"])}">{escape(str(user.get("first_name") or "Member"))}</a>'
+
+    # As requested, reply in the group so no private /start is required.
+    send(
+        chat.get("id", GROUP_ID),
+        f"🔗 {mention}, your personal invite link is ready:\n<code>{escape(link)}</code>\n\n"
+        "Share it with genuine friends to join the 500 TON giveaway!",
+        parse_mode="HTML",
+        reply_to_message_id=message.get("message_id"),
+    )
+
 def process_update(update):
     try:
         if "message" in update:
             handle_message(update["message"])
         if "chat_member" in update:
             handle_chat_member(update["chat_member"])
+        if "callback_query" in update:
+            handle_callback_query(update["callback_query"])
     except Exception:
         log.exception("Error processing Telegram update")
 
@@ -427,11 +515,21 @@ def setup_webhook():
 
     result = tg("setWebhook", {
         "url": f"{RENDER_EXTERNAL_URL}/webhook",
-        "allowed_updates": ["message", "chat_member"],
+        "allowed_updates": ["message", "chat_member", "callback_query"],
         "drop_pending_updates": False,
         "secret_token": WEBHOOK_SECRET,
     })
     return jsonify(result)
+
+
+# Render start command should use one Gunicorn worker to avoid duplicate reminders.
+# The daemon stops automatically when the process exits.
+_reminder_thread = threading.Thread(
+    target=send_mylink_reminder,
+    name="mylink-reminder",
+    daemon=True,
+)
+_reminder_thread.start()
 
 
 if __name__ == "__main__":
