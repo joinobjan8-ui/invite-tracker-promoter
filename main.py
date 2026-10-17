@@ -538,7 +538,7 @@ def reminder_keyboard():
 def send_mylink_reminder():
     """Post a group reminder with a clickable /mylink button every 30 seconds."""
     while True:
-        time.sleep(120)
+        time.sleep(1000)
         try:
             if not GROUP_ID:
                 log.error("GROUP_ID is empty; skipping /mylink reminder")
