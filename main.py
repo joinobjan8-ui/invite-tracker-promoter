@@ -132,9 +132,8 @@ def make_invite_link(user):
             "inviter_id": user_id,
             "invite_link": link,
             "inviter_name": (
-                user.get("username")
-                or user.get("first_name")
-                or str(user_id)
+                ("@" + user["username"]) if user.get("username")
+                else (user.get("first_name") or str(user_id))
             ),
             "created_at": datetime.now(timezone.utc),
         }},
@@ -197,6 +196,35 @@ def send_personal_link(chat_id, user):
     )
     send(chat_id, message, reply_markup=private_link_keyboard(link))
 
+
+
+def get_inviter_display_name(inviter_id, chat_key):
+    """Prefer a real Telegram username; fall back to the stored display name."""
+    try:
+        result = tg("getChatMember", {
+            "chat_id": GROUP_ID,
+            "user_id": int(inviter_id),
+        })
+        member_user = (result.get("result") or {}).get("user") or {}
+        if member_user.get("username"):
+            return "@" + member_user["username"]
+        if member_user.get("first_name"):
+            return member_user["first_name"]
+    except Exception:
+        log.info("Could not fetch current username for inviter %s", inviter_id)
+
+    owner = db.invite_links.find_one({
+        "chat_id": chat_key,
+        "inviter_id": int(inviter_id),
+    }, {"inviter_name": 1, "_id": 0}) if db is not None else None
+    name = (owner or {}).get("inviter_name")
+    if not name and db is not None:
+        ref = db.referrals.find_one({
+            "chat_id": chat_key,
+            "inviter_id": int(inviter_id),
+        }, {"inviter_name": 1, "_id": 0})
+        name = (ref or {}).get("inviter_name")
+    return str(name or f"User {inviter_id}")
 
 def handle_message(message):
     text = (message.get("text") or "").strip()
@@ -267,33 +295,48 @@ def handle_message(message):
             send(chat_id, "⚠️ MongoDB is not configured.")
             return
 
+        chat_key = str(GROUP_ID)
+        user_id = int(sender["id"])
+        my_count = db.referrals.count_documents({
+            "chat_id": chat_key,
+            "inviter_id": user_id,
+        })
+
+        # Build top 5 from tracked unique referrals; use stored username/name.
         pipeline = [
-            {"$match": {"chat_id": str(GROUP_ID)}},
+            {"$match": {"chat_id": chat_key}},
             {"$group": {
                 "_id": "$inviter_id",
                 "count": {"$sum": 1},
-                "name": {"$last": "$inviter_name"},
             }},
-            {"$sort": {"count": DESCENDING, "_id": ASCENDING}},
-            {"$limit": 100},
+            {"$sort": {"count": -1, "_id": 1}},
+            {"$limit": 5},
         ]
-        rows = list(db.referrals.aggregate(pipeline))
-        if not rows:
-            send(
-                chat_id,
-                "🏆 PROMOTER TOP INVITERS\n\n"
-                "No tracked referrals yet.\n"
-                "Type /mylink to get your personal invite link.",
-            )
-            return
+        top_rows = list(db.referrals.aggregate(pipeline))
 
-        lines = ["🏆 PROMOTER TOP INVITERS", "💎 500 TON GIVEAWAY", ""]
-        for rank, row in enumerate(rows, 1):
-            name = str(row.get("name") or row["_id"])
-            name = name.replace("<", "").replace(">", "")
-            lines.append(f"{rank}. {name} — {row['count']} valid invite(s)")
-        lines.extend(["", "📌 Counts are based on tracked unique new members."])
-        send(chat_id, "\n".join(lines))
+        # Prefer the inviter username/name saved with their personal invite link.
+        lines = [
+            "🏆 <b>PROMOTER INVITE LEADERBOARD</b>",
+            "💎 500 TON GIVEAWAY • TOP 5",
+            "",
+            f"👤 <b>Your invites:</b> {my_count}",
+            "",
+            "🔥 <b>TOP 5 INVITERS</b>",
+        ]
+        if not top_rows:
+            lines.append("No tracked invites yet. Be the first!")
+        else:
+            for rank, row in enumerate(top_rows, 1):
+                inviter_id = int(row["_id"])
+                display_name = escape(get_inviter_display_name(inviter_id, chat_key))
+                lines.append(f"{rank}. {display_name} — <b>{row['count']}</b> invite(s)")
+
+        lines.extend([
+            "",
+            "📌 Only tracked, unique new members are counted.",
+            "🚀 Tap /mylink to get your personal invite link.",
+        ])
+        send(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
 def welcome_new_member(chat_id, user):
@@ -382,10 +425,11 @@ def handle_chat_member(update):
 
 
 def reminder_keyboard():
-    # Tapping this button runs the bot callback for the tapping user.
+    # Inline buttons act for the Telegram user who taps them.
     return {
         "inline_keyboard": [[
-            {"text": "/mylink", "callback_data": "generate_mylink"}
+            {"text": "🔗 /mylink", "callback_data": "generate_mylink"},
+            {"text": "🏆 /topinviter", "callback_data": "show_topinviter"},
         ]]
     }
 
@@ -393,7 +437,7 @@ def reminder_keyboard():
 def send_mylink_reminder():
     """Post a group reminder with a clickable /mylink button every 30 seconds."""
     while True:
-        time.sleep(30)
+        time.sleep(120)
         try:
             if not GROUP_ID:
                 log.error("GROUP_ID is empty; skipping /mylink reminder")
@@ -416,8 +460,9 @@ def handle_callback_query(callback):
     callback_id = callback.get("id", "")
     message = callback.get("message") or {}
     chat = message.get("chat") or {}
+    chat_id = chat.get("id", GROUP_ID)
 
-    if data != "generate_mylink":
+    if data not in ("generate_mylink", "show_topinviter"):
         if callback_id:
             tg("answerCallbackQuery", {
                 "callback_query_id": callback_id,
@@ -432,19 +477,65 @@ def handle_callback_query(callback):
     try:
         tg("answerCallbackQuery", {
             "callback_query_id": callback_id,
-            "text": "Generating your personal invite link…",
+            "text": (
+                "Generating your personal invite link…"
+                if data == "generate_mylink"
+                else "Loading your invite stats…"
+            ),
             "show_alert": False,
         })
     except Exception:
         log.exception("Could not answer callback query")
 
-    # The clicked user's Telegram identity is used, so each user gets their own link.
+    if data == "show_topinviter":
+        if db is None:
+            send(chat_id, "⚠️ MongoDB is not configured.")
+            return
+
+        chat_key = str(GROUP_ID)
+        my_count = db.referrals.count_documents({
+            "chat_id": chat_key,
+            "inviter_id": int(user["id"]),
+        })
+        pipeline = [
+            {"$match": {"chat_id": chat_key}},
+            {"$group": {
+                "_id": "$inviter_id",
+                "count": {"$sum": 1},
+            }},
+            {"$sort": {"count": -1, "_id": 1}},
+            {"$limit": 5},
+        ]
+        top_rows = list(db.referrals.aggregate(pipeline))
+        lines = [
+            "🏆 <b>PROMOTER INVITE LEADERBOARD</b>",
+            "💎 500 TON GIVEAWAY • TOP 5",
+            "",
+            f"👤 <b>Your invites:</b> {my_count}",
+            "",
+            "🔥 <b>TOP 5 INVITERS</b>",
+        ]
+        if not top_rows:
+            lines.append("No tracked invites yet. Be the first!")
+        else:
+            for rank, row in enumerate(top_rows, 1):
+                inviter_id = int(row["_id"])
+                display_name = escape(get_inviter_display_name(inviter_id, chat_key))
+                lines.append(f"{rank}. {display_name} — <b>{row['count']}</b> invite(s)")
+        lines.extend(["", "📌 Counts include tracked unique new members."])
+        send(chat_id, "\n".join(lines), parse_mode="HTML",
+             reply_to_message_id=message.get("message_id"))
+        return
+
+    # The clicked user's Telegram identity determines their personal link.
     link, error = make_invite_link(user)
     if error:
+        name = escape(str(user.get("username") and ("@" + user["username"]) or user.get("first_name") or "this user"))
         send(
-            chat.get("id", GROUP_ID),
-            f"❌ Could not create a link for {escape(str(user.get('first_name') or 'this user'))}. "
+            chat_id,
+            f"❌ Could not create a link for {name}. "
             "Please check the bot's Manage Invite Links permission.",
+            parse_mode="HTML",
             reply_to_message_id=message.get("message_id"),
         )
         return
@@ -455,14 +546,14 @@ def handle_callback_query(callback):
     else:
         mention = f'<a href="tg://user?id={int(user["id"])}">{escape(str(user.get("first_name") or "Member"))}</a>'
 
-    # As requested, reply in the group so no private /start is required.
     send(
-        chat.get("id", GROUP_ID),
+        chat_id,
         f"🔗 {mention}, your personal invite link is ready:\n<code>{escape(link)}</code>\n\n"
         "Share it with genuine friends to join the 500 TON giveaway!",
         parse_mode="HTML",
         reply_to_message_id=message.get("message_id"),
     )
+
 
 def process_update(update):
     try:
