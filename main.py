@@ -409,8 +409,9 @@ def handle_message(message):
         send(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
+
 def welcome_new_member(chat_id, user):
-    """Post a short public message mentioning the member who joined."""
+    """Welcome new members with My Link and Top Inviter buttons."""
     user_id = user.get("id")
     if not user_id:
         return
@@ -418,18 +419,48 @@ def welcome_new_member(chat_id, user):
     first_name = escape(str(user.get("first_name") or "friend"))
     username = user.get("username")
 
-    # Mention username when present; otherwise use a clickable name mention.
+    # Mention the new member by username or clickable Telegram profile.
     if username:
-        mention = f'<a href="https://t.me/{escape(username, quote=True)}">@{escape(username)}</a>'
+        safe_username = escape(username, quote=True)
+        safe_display = escape(username)
+        mention = (
+            f'<a href="https://t.me/{safe_username}">'
+            f'@{safe_display}</a>'
+        )
     else:
-        mention = f'<a href="tg://user?id={int(user_id)}">{first_name}</a>'
+        mention = (
+            f'<a href="tg://user?id={int(user_id)}">'
+            f'{first_name}</a>'
+        )
 
     message = (
         f"🎉 Welcome to <b>PROMOTER</b>, {mention}! 🚀\n"
         "💎 <b>500 TON GIVEAWAY • 100 WINNERS</b> 🏆\n"
-        "👇 Type <code>/mylink</code> here to get started!"
+        "👇 Choose an option below to get started!"
     )
-    send(chat_id, message, parse_mode="HTML")
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "🔗 /mylink",
+                    "callback_data": "generate_mylink"
+                },
+                {
+                    "text": "🏆 /topinviter",
+                    "callback_data": "show_topinviter"
+                }
+            ]
+        ]
+    }
+
+    send(
+        chat_id,
+        message,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
 
 
 def handle_chat_member(update):
