@@ -51,9 +51,6 @@ if db is not None:
     db.referrals.create_index(
         [("chat_id", ASCENDING), ("inviter_id", ASCENDING)]
     )
-    db.referrals.create_index(
-        [("chat_id", ASCENDING), ("active", ASCENDING), ("inviter_id", ASCENDING)]
-    )
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 _bot_username = None
@@ -229,7 +226,76 @@ def get_inviter_display_name(inviter_id, chat_key):
         name = (ref or {}).get("inviter_name")
     return str(name or f"User {inviter_id}")
 
+
+# --- Group content moderation: only admins may post links/media/buttons ---
+URL_RE = re.compile(
+    r"(?i)(?:https?://|www\.|t\.me/|telegram\.me/|telegram\.dog/|"
+    r"\b[a-z0-9][a-z0-9.-]*\.(?:com|net|org|io|co|xyz|app|site|me|link|"
+    r"click|live|online|info|biz|ru|us|uk|gg|dev|ai|shop|store)\b)"
+)
+MEDIA_FIELDS = (
+    "photo", "video", "animation", "document", "audio", "voice",
+    "video_note", "sticker",
+)
+
+def user_is_group_admin(chat_id, user_id):
+    """Return True only for group creator/admin; fail closed if API check fails."""
+    try:
+        result = tg("getChatMember", {"chat_id": chat_id, "user_id": int(user_id)})
+        member = result.get("result") or {}
+        return member.get("status") in ("creator", "administrator")
+    except Exception:
+        log.exception("Could not check admin status for user %s", user_id)
+        return False
+
+def message_has_restricted_content(message):
+    if (message.get("reply_markup") or {}).get("inline_keyboard"):
+        return True
+    if any(message.get(field) for field in MEDIA_FIELDS):
+        return True
+
+    text = message.get("text") or message.get("caption") or ""
+    if URL_RE.search(text):
+        return True
+
+    for field in ("entities", "caption_entities"):
+        for entity in message.get(field, []) or []:
+            if entity.get("type") in ("url", "text_link"):
+                return True
+    return False
+
+def moderate_group_message(message):
+    """Delete non-admin group posts containing links, media, or inline buttons."""
+    chat = message.get("chat") or {}
+    if not is_target_chat(chat) or chat.get("type") not in ("group", "supergroup"):
+        return False
+
+    sender = message.get("from") or {}
+    if not sender or sender.get("is_bot"):
+        return False
+    if not message_has_restricted_content(message):
+        return False
+    if user_is_group_admin(chat.get("id"), sender.get("id")):
+        return False
+
+    try:
+        result = tg("deleteMessage", {
+            "chat_id": chat.get("id"),
+            "message_id": message.get("message_id"),
+        })
+        if result.get("ok"):
+            log.info("Deleted link/media/button message from user %s", sender.get("id"))
+        else:
+            log.warning("Telegram could not delete message: %s", result.get("description"))
+    except Exception:
+        log.exception("Failed deleting restricted group message")
+    return True
+
 def handle_message(message):
+    # Moderation first: non-admin link/media/button posts are removed.
+    if moderate_group_message(message):
+        return
+
     text = (message.get("text") or "").strip()
     if not text.startswith("/"):
         return
@@ -303,15 +369,11 @@ def handle_message(message):
         my_count = db.referrals.count_documents({
             "chat_id": chat_key,
             "inviter_id": user_id,
-            "$or": [{"active": True}, {"active": {"$exists": False}}],
         })
 
         # Build top 5 from tracked unique referrals; use stored username/name.
         pipeline = [
-            {"$match": {
-                "chat_id": chat_key,
-                "$or": [{"active": True}, {"active": {"$exists": False}}],
-            }},
+            {"$match": {"chat_id": chat_key}},
             {"$group": {
                 "_id": "$inviter_id",
                 "count": {"$sum": 1},
@@ -376,106 +438,59 @@ def handle_chat_member(update):
 
     old = update.get("old_chat_member", {})
     new = update.get("new_chat_member", {})
-    was_member = is_member_status(old)
-    is_member = is_member_status(new)
-    changed_user = new.get("user") or old.get("user") or {}
-    if not changed_user.get("id") or was_member == is_member:
+
+    # Send one welcome only when the user becomes a member.
+    if is_member_status(old) or not is_member_status(new):
         return
 
-    chat_key = str(GROUP_ID)
-    referred_id = int(changed_user["id"])
+    joined = new.get("user", {})
+    try:
+        welcome_new_member(chat.get("id"), joined)
+    except Exception:
+        log.exception("Could not send new-member welcome message")
 
-    if is_member:
-        try:
-            welcome_new_member(chat.get("id"), changed_user)
-        except Exception:
-            log.exception("Could not send new-member welcome message")
-
-        if db is None:
-            log.warning("MongoDB is not configured; skipping referral tracking")
-            return
-
-        # Keep original attribution and reactivate the same unique referral on rejoin.
-        existing = db.referrals.find_one({
-            "chat_id": chat_key,
-            "referred_id": referred_id,
-        })
-        if existing:
-            db.referrals.update_one(
-                {"_id": existing["_id"]},
-                {"$set": {
-                    "active": True,
-                    "last_joined_at": datetime.now(timezone.utc),
-                    "referred_name": (
-                        ("@" + changed_user["username"])
-                        if changed_user.get("username")
-                        else (changed_user.get("first_name") or str(referred_id))
-                    ),
-                }},
-            )
-            log.info("Reactivated referral: inviter=%s joined=%s",
-                     existing.get("inviter_id"), referred_id)
-            return
-
-        invite = update.get("invite_link") or {}
-        link = invite.get("invite_link")
-        if not link:
-            log.info("Join event has no invite_link; cannot attribute referral.")
-            return
-
-        record = db.invite_links.find_one({
-            "chat_id": chat_key,
-            "invite_link": link,
-        })
-        if not record:
-            log.info("Join used an untracked invite link.")
-            return
-
-        inviter_id = int(record["inviter_id"])
-        if inviter_id == referred_id:
-            return
-
-        try:
-            db.referrals.insert_one({
-                "chat_id": chat_key,
-                "inviter_id": inviter_id,
-                "inviter_name": record.get("inviter_name", str(inviter_id)),
-                "referred_id": referred_id,
-                "referred_name": (
-                    ("@" + changed_user["username"])
-                    if changed_user.get("username")
-                    else (changed_user.get("first_name") or str(referred_id))
-                ),
-                "invite_link": link,
-                "joined_at": datetime.now(timezone.utc),
-                "active": True,
-            })
-            log.info("Tracked active referral: inviter=%s joined=%s",
-                     inviter_id, referred_id)
-        except Exception as exc:
-            if exc.__class__.__name__ == "DuplicateKeyError":
-                db.referrals.update_one(
-                    {"chat_id": chat_key, "referred_id": referred_id},
-                    {"$set": {"active": True, "last_joined_at": datetime.now(timezone.utc)}},
-                )
-            else:
-                log.exception("Could not save referral")
-        return
-
-    # Member left or was banned: deactivate their referral so it no longer counts.
+    # Referral tracking requires MongoDB and a tracked invite link.
     if db is None:
-        log.warning("MongoDB is not configured; cannot deactivate referral")
+        log.warning("MongoDB is not configured; skipping referral tracking")
         return
 
-    result = db.referrals.update_one(
-        {"chat_id": chat_key, "referred_id": referred_id, "active": {"$ne": False}},
-        {"$set": {
-            "active": False,
-            "left_at": datetime.now(timezone.utc),
-        }},
-    )
-    if result.modified_count:
-        log.info("Deactivated referral after leave: user=%s", referred_id)
+    invite = update.get("invite_link") or {}
+    link = invite.get("invite_link")
+    if not joined.get("id") or not link:
+        return
+
+    record = db.invite_links.find_one({
+        "chat_id": str(GROUP_ID),
+        "invite_link": link,
+    })
+    if not record:
+        log.info("Join used an untracked invite link.")
+        return
+
+    inviter_id = int(record["inviter_id"])
+    referred_id = int(joined["id"])
+    if inviter_id == referred_id:
+        return
+
+    try:
+        db.referrals.insert_one({
+            "chat_id": str(GROUP_ID),
+            "inviter_id": inviter_id,
+            "inviter_name": record.get("inviter_name", str(inviter_id)),
+            "referred_id": referred_id,
+            "referred_name": (
+                joined.get("username")
+                or joined.get("first_name")
+                or str(referred_id)
+            ),
+            "invite_link": link,
+            "joined_at": datetime.now(timezone.utc),
+        })
+        log.info("Tracked referral: inviter=%s joined=%s", inviter_id, referred_id)
+    except Exception as exc:
+        if exc.__class__.__name__ != "DuplicateKeyError":
+            log.exception("Could not save referral")
+
 
 
 def reminder_keyboard():
@@ -489,7 +504,7 @@ def reminder_keyboard():
 
 
 def send_mylink_reminder():
-    """Post a group reminder with a clickable /mylink button every 2 minutes."""
+    """Post a group reminder with a clickable /mylink button every 30 seconds."""
     while True:
         time.sleep(120)
         try:
@@ -505,7 +520,7 @@ def send_mylink_reminder():
                 reply_markup=reminder_keyboard(),
             )
         except Exception:
-            log.exception("Could not send 2-minute /mylink reminder")
+            log.exception("Could not send 30-second /mylink reminder")
 
 
 def handle_callback_query(callback):
@@ -550,13 +565,9 @@ def handle_callback_query(callback):
         my_count = db.referrals.count_documents({
             "chat_id": chat_key,
             "inviter_id": int(user["id"]),
-            "$or": [{"active": True}, {"active": {"$exists": False}}],
         })
         pipeline = [
-            {"$match": {
-                "chat_id": chat_key,
-                "$or": [{"active": True}, {"active": {"$exists": False}}],
-            }},
+            {"$match": {"chat_id": chat_key}},
             {"$group": {
                 "_id": "$inviter_id",
                 "count": {"$sum": 1},
