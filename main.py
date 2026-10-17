@@ -588,16 +588,34 @@ def handle_callback_query(callback):
     except Exception:
         log.exception("Could not answer callback query")
 
+    
     if data == "show_topinviter":
         if db is None:
             send(chat_id, "⚠️ MongoDB is not configured.")
             return
 
         chat_key = str(GROUP_ID)
+        user_id = int(user["id"])
+
         my_count = db.referrals.count_documents({
             "chat_id": chat_key,
-            "inviter_id": int(user["id"]),
+            "inviter_id": user_id,
         })
+
+        # Mention the user who clicked the Top Inviter button.
+        username = user.get("username")
+        if username:
+            user_mention = (
+                f'<a href="https://t.me/{escape(username, quote=True)}">'
+                f'@{escape(username)}</a>'
+            )
+        else:
+            display_name = escape(str(user.get("first_name") or "Member"))
+            user_mention = (
+                f'<a href="tg://user?id={user_id}">'
+                f'{display_name}</a>'
+            )
+
         pipeline = [
             {"$match": {"chat_id": chat_key}},
             {"$group": {
@@ -607,31 +625,55 @@ def handle_callback_query(callback):
             {"$sort": {"count": -1, "_id": 1}},
             {"$limit": 5},
         ]
+
         top_rows = list(db.referrals.aggregate(pipeline))
+
         lines = [
             "🏆 <b>PROMOTER INVITE LEADERBOARD</b>",
             "💎 500 TON GIVEAWAY • TOP 5",
             "",
-            f"👤 <b>Your invites:</b> {my_count}",
+            f"👤 <b>{user_mention}, your invites:</b> {my_count}",
             "",
             "🔥 <b>TOP 5 INVITERS</b>",
         ]
+
         if not top_rows:
             lines.append("No tracked invites yet. Be the first!")
         else:
             for rank, row in enumerate(top_rows, 1):
                 inviter_id = int(row["_id"])
-                display_name = escape(get_inviter_display_name(inviter_id, chat_key))
-                lines.append(f"{rank}. {display_name} — <b>{row['count']}</b> invite(s)")
-        lines.extend(["", "📌 Counts include tracked unique new members."])
-        send(chat_id, "\n".join(lines), parse_mode="HTML",
-             reply_to_message_id=message.get("message_id"))
+                display_name = escape(
+                    get_inviter_display_name(inviter_id, chat_key)
+                )
+                lines.append(
+                    f"{rank}. {display_name} — "
+                    f"<b>{row['count']}</b> invite(s)"
+                )
+
+        lines.extend([
+            "",
+            "📌 Counts include tracked unique new members.",
+        ])
+
+        send(
+            chat_id,
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_to_message_id=message.get("message_id"),
+        )
         return
 
     # The clicked user's Telegram identity determines their personal link.
     link, error = make_invite_link(user)
     if error:
-        name = escape(str(user.get("username") and ("@" + user["username"]) or user.get("first_name") or "this user"))
+        name = escape(
+            str(
+                user.get("username")
+                and ("@" + user["username"])
+                or user.get("first_name")
+                or "this user"
+            )
+        )
         send(
             chat_id,
             f"❌ Could not create a link for {name}. "
@@ -643,13 +685,20 @@ def handle_callback_query(callback):
 
     username = user.get("username")
     if username:
-        mention = f'<a href="https://t.me/{escape(username, quote=True)}">@{escape(username)}</a>'
+        mention = (
+            f'<a href="https://t.me/{escape(username, quote=True)}">'
+            f'@{escape(username)}</a>'
+        )
     else:
-        mention = f'<a href="tg://user?id={int(user["id"])}">{escape(str(user.get("first_name") or "Member"))}</a>'
+        mention = (
+            f'<a href="tg://user?id={int(user["id"])}">'
+            f'{escape(str(user.get("first_name") or "Member"))}</a>'
+        )
 
     send(
         chat_id,
-        f"🔗 {mention}, your personal invite link is ready:\n<code>{escape(link)}</code>\n\n"
+        f"🔗 {mention}, your personal invite link is ready:\n"
+        f"<code>{escape(link)}</code>\n\n"
         "Share it with genuine friends to join the 500 TON giveaway!",
         parse_mode="HTML",
         reply_to_message_id=message.get("message_id"),
@@ -666,6 +715,7 @@ def process_update(update):
             handle_callback_query(update["callback_query"])
     except Exception:
         log.exception("Error processing Telegram update")
+
 
 
 @app.get("/")
