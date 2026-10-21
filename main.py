@@ -608,7 +608,7 @@ def reminder_keyboard():
 def send_mylink_reminder():
     """Post a group reminder every 2 minutes when enabled."""
     while True:
-        time.sleep(120)
+        time.sleep(1000)
         try:
             if not get_setting("automsg_enabled"):
                 continue
