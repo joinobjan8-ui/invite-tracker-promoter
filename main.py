@@ -230,7 +230,15 @@ def get_inviter_display_name(inviter_id, chat_key):
 
 
 # Persistent owner-controlled switches (stored in MongoDB across restarts).
-DEFAULT_SETTINGS = {"welcome_enabled": True, "automsg_enabled": True, "all_messages_enabled": True, "linkmedia_enabled": True}
+DEFAULT_SETTINGS = {
+    "welcome_enabled": True,          # Welcome message visible in the group
+    "welcome_admin_enabled": False,   # Join notification sent to OWNER_ID privately
+    "automsg_enabled": True,
+    "all_messages_enabled": True,
+    "linkmedia_enabled": True,
+    "autodelete_enabled": True,
+    "autodelete_seconds": 30,
+}
 
 def get_setting(key):
     if db is None:
@@ -243,27 +251,64 @@ def get_setting(key):
         return DEFAULT_SETTINGS.get(key, True)
 
 def set_setting(key, value):
+    # Preserve numeric values such as autodelete_seconds; switches are passed as bools.
     if db is not None:
-        db.bot_settings.update_one({"_id": "global"}, {"$set": {key: bool(value)}}, upsert=True)
+        db.bot_settings.update_one({"_id": "global"}, {"$set": {key: value}}, upsert=True)
     else:
-        DEFAULT_SETTINGS[key] = bool(value)
+        DEFAULT_SETTINGS[key] = value
+
+
+def send_auto_delete(chat_id, text, **kwargs):
+    """Send a message and schedule deletion for group replies when enabled."""
+    result = send(chat_id, text, **kwargs)
+    chat = result.get("result", {}).get("chat", {})
+    message_id = result.get("result", {}).get("message_id")
+    # Private chats (including personal invite links) are intentionally not deleted.
+    if (is_target_chat(chat) and chat.get("type") in ("group", "supergroup")
+            and message_id and get_setting("autodelete_enabled")):
+        try:
+            delay = int(get_setting("autodelete_seconds"))
+        except (TypeError, ValueError):
+            delay = 30
+        delay = max(5, min(delay, 86400))
+
+        def delete_later():
+            try:
+                tg("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+            except Exception:
+                log.exception("Could not auto-delete bot response %s", message_id)
+
+        timer = threading.Timer(delay, delete_later)
+        timer.daemon = True
+        timer.start()
+    return result
 
 def is_owner(user):
     return bool(OWNER_ID and str((user or {}).get("id", "")) == OWNER_ID)
 
 def owner_help_text():
     return (
-        "🛠 PROMOTER OWNER CONTROL\n\n"
+        "🛠 PROMOTER ADMIN COMMANDS\n\n"
         "/help — show this command list\n"
-        "/welcome_on — enable new-member welcome\n"
-        "/welcome_off — disable new-member welcome\n"
+        "/welcome_on — show new-member welcome in the group\n"
+        "/welcome_off — turn off group welcome\n"
+        "/welcome_all_on — welcome message to all group members\n"
+        "/welcome_all_off — turn off group welcome for all members\n"
+        "/welcome_admin_on — send join notices to the owner's bot inbox\n"
+        "/welcome_admin_off — turn off private admin join notices\n"
         "/automsg_on — enable recurring group reminder\n"
         "/automsg_off — disable recurring group reminder\n"
         "/allmsg_on — allow normal member messages\n"
         "/allmsg_off — delete all non-admin group messages\n"
         "/linkmedia_on — block links/photos/media/buttons from non-admins\n"
-        "/linkmedia_off — disable link/media/button filter\n\n"
-        f"Current: welcome={get_setting('welcome_enabled')}, "
+        "/linkmedia_off — disable link/media/button filter\n"
+        "/autodelete_on — auto-delete bot replies to group /mylink and /topinviter\n"
+        "/autodelete_off — disable auto-delete\n"
+        "/autodelete_time 30 — set auto-delete delay in seconds (5–86400)\n\n"
+        f"Current settings: group_welcome={get_setting('welcome_enabled')}, "
+        f"admin_join_notice={get_setting('welcome_admin_enabled')}, "
+        f"autodelete={get_setting('autodelete_enabled')}, "
+        f"autodelete_seconds={get_setting('autodelete_seconds')}, "
         f"automsg={get_setting('automsg_enabled')}, "
         f"allmsg={get_setting('all_messages_enabled')}, "
         f"linkmedia={get_setting('linkmedia_enabled')}"
@@ -345,22 +390,50 @@ def handle_message(message):
     if text.startswith("/") and is_owner(sender):
         owner_command = text.split(maxsplit=1)[0].split("@")[0].lower()
         setting_commands = {
-            "/welcome_on": ("welcome_enabled", True, "Welcome messages enabled."),
-            "/welcome_off": ("welcome_enabled", False, "Welcome messages disabled."),
+            "/welcome_on": ("welcome_enabled", True, "Group welcome messages enabled."),
+            "/welcome_off": ("welcome_enabled", False, "Group welcome messages disabled."),
+            "/welcome_all_on": ("welcome_enabled", True, "Welcome messages will be visible to all group members."),
+            "/welcome_all_off": ("welcome_enabled", False, "Group welcome messages disabled."),
+            "/welcome_admin_on": ("welcome_admin_enabled", True, "Join notifications will be sent privately to OWNER_ID. Start the bot in private first."),
+            "/welcome_admin_off": ("welcome_admin_enabled", False, "Private admin join notifications disabled."),
             "/automsg_on": ("automsg_enabled", True, "Automatic group reminders enabled."),
             "/automsg_off": ("automsg_enabled", False, "Automatic group reminders disabled."),
             "/allmsg_on": ("all_messages_enabled", True, "Normal member messages are allowed."),
             "/allmsg_off": ("all_messages_enabled", False, "All non-admin group messages will be deleted."),
             "/linkmedia_on": ("linkmedia_enabled", True, "Link/media/button filtering enabled."),
             "/linkmedia_off": ("linkmedia_enabled", False, "Link/media/button filtering disabled."),
+            "/autodelete_on": ("autodelete_enabled", True, "Auto-delete enabled."),
+            "/autodelete_off": ("autodelete_enabled", False, "Auto-delete disabled."),
         }
         if owner_command in ("/help", "/owner"):
             send(message.get("chat", {}).get("id"), owner_help_text())
             return
+        if owner_command in ("/welcome_on", "/welcome_all_on"):
+            set_setting("welcome_enabled", True)
+            set_setting("welcome_admin_enabled", False)
+            send(chat.get("id"), "✅ Welcome messages will be posted in the group for all members.")
+            return
+        if owner_command == "/welcome_admin_on":
+            set_setting("welcome_enabled", False)
+            set_setting("welcome_admin_enabled", True)
+            send(chat.get("id"), "✅ Group welcome disabled; join notices will be sent to OWNER_ID privately. Start the bot in private first.")
+            return
+        if owner_command == "/autodelete_time":
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2 or not parts[1].strip().isdigit():
+                send(chat.get("id"), "Usage: /autodelete_time 30 (seconds; minimum 5, maximum 86400)")
+                return
+            seconds = int(parts[1].strip())
+            if not 5 <= seconds <= 86400:
+                send(chat.get("id"), "Please choose a delay from 5 to 86400 seconds.")
+                return
+            set_setting("autodelete_seconds", seconds)
+            send(chat.get("id"), f"✅ Auto-delete delay set to {seconds} seconds.")
+            return
         if owner_command in setting_commands:
             key, value, response_text = setting_commands[owner_command]
             set_setting(key, value)
-            send(message.get("chat", {}).get("id"), "✅ " + response_text)
+            send(chat.get("id"), "✅ " + response_text)
             return
 
     # Moderation removes restricted content from non-admins.
@@ -415,7 +488,7 @@ def handle_message(message):
 
         username = sender.get("username")
         who = f"@{username}" if username else (sender.get("first_name") or "there")
-        send(
+        send_auto_delete(
             chat_id,
             f"👋 {escape(str(who))}, tap below to open the bot and press START "
             "to receive your personal invite link.\n\n"
@@ -475,7 +548,10 @@ def handle_message(message):
             "📌 Only tracked, unique new members are counted.",
             "🚀 Tap /mylink to get your personal invite link.",
         ])
-        send(chat_id, "\n".join(lines), parse_mode="HTML")
+        if chat_type == "private":
+            send(chat_id, "\n".join(lines), parse_mode="HTML")
+        else:
+            send_auto_delete(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
 
@@ -550,6 +626,14 @@ def handle_chat_member(update):
             welcome_new_member(chat.get("id"), joined)
         except Exception:
             log.exception("Could not send new-member welcome message")
+    elif get_setting("welcome_admin_enabled"):
+        # Telegram bots cannot DM users until they have opened/started the bot.
+        if OWNER_ID:
+            try:
+                who = joined.get("username") and ("@" + joined["username"]) or joined.get("first_name") or str(joined.get("id"))
+                send(int(OWNER_ID), f"👋 New member joined the group: {escape(str(who))} (ID: {joined.get('id')})")
+            except Exception:
+                log.exception("Could not send private join notice to OWNER_ID")
 
     # Referral tracking requires MongoDB and a tracked invite link.
     if db is None:
@@ -727,7 +811,7 @@ def handle_callback_query(callback):
             "📌 Counts include tracked unique new members.",
         ])
 
-        send(
+        send_auto_delete(
             chat_id,
             "\n".join(lines),
             parse_mode="HTML",
@@ -767,7 +851,7 @@ def handle_callback_query(callback):
             f'{escape(str(user.get("first_name") or "Member"))}</a>'
         )
 
-    send(
+    send_auto_delete(
         chat_id,
         f"🔗 {mention}, your personal invite link is ready:\n"
         f"<code>{escape(link)}</code>\n\n"
