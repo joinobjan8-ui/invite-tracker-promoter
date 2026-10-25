@@ -234,6 +234,8 @@ DEFAULT_SETTINGS = {
     "welcome_enabled": True,          # Welcome message visible in the group
     "welcome_admin_enabled": False,   # Join notification sent to OWNER_ID privately
     "automsg_enabled": True,
+    "automsg_interval_seconds": 60,  # Send reminder every 60 seconds
+    "automsg_duration_seconds": 10,  # Delete reminder after 10 seconds
     "all_messages_enabled": True,
     "linkmedia_enabled": True,
     "autodelete_enabled": True,
@@ -298,6 +300,8 @@ def owner_help_text():
         "/welcome_admin_off — turn off private admin join notices\n"
         "/automsg_on — enable recurring group reminder\n"
         "/automsg_off — disable recurring group reminder\n"
+        "/automsg_interval 60 — set reminder interval in seconds (10–86400)\n"
+        "/automsg_duration 10 — set reminder visibility in seconds (1–86400)\n"
         "/allmsg_on — allow normal member messages\n"
         "/allmsg_off — delete all non-admin group messages\n"
         "/linkmedia_on — block links/photos/media/buttons from non-admins\n"
@@ -310,6 +314,8 @@ def owner_help_text():
         f"autodelete={get_setting('autodelete_enabled')}, "
         f"autodelete_seconds={get_setting('autodelete_seconds')}, "
         f"automsg={get_setting('automsg_enabled')}, "
+        f"automsg_interval_seconds={get_setting('automsg_interval_seconds')}, "
+        f"automsg_duration_seconds={get_setting('automsg_duration_seconds')}, "
         f"allmsg={get_setting('all_messages_enabled')}, "
         f"linkmedia={get_setting('linkmedia_enabled')}"
     )
@@ -418,6 +424,27 @@ def handle_message(message):
             set_setting("welcome_admin_enabled", True)
             send(chat.get("id"), "✅ Group welcome disabled; join notices will be sent to OWNER_ID privately. Start the bot in private first.")
             return
+        if owner_command in ("/automsg_interval", "/automsg_duration"):
+            parts = text.split(maxsplit=1)
+            label = "interval" if owner_command == "/automsg_interval" else "duration"
+            setting_key = (
+                "automsg_interval_seconds"
+                if owner_command == "/automsg_interval"
+                else "automsg_duration_seconds"
+            )
+            minimum = 10 if label == "interval" else 1
+            if len(parts) != 2 or not parts[1].strip().isdigit():
+                example = "60" if label == "interval" else "10"
+                send(chat.get("id"), f"Usage: /automsg_{label} {example} (seconds)")
+                return
+            seconds = int(parts[1].strip())
+            if not minimum <= seconds <= 86400:
+                send(chat.get("id"), f"Please choose a {label} from {minimum} to 86400 seconds.")
+                return
+            set_setting(setting_key, seconds)
+            send(chat.get("id"), f"✅ Automatic message {label} set to {seconds} seconds.")
+            return
+
         if owner_command == "/autodelete_time":
             parts = text.split(maxsplit=1)
             if len(parts) != 2 or not parts[1].strip().isdigit():
@@ -690,23 +717,51 @@ def reminder_keyboard():
 
 
 def send_mylink_reminder():
-    """Post a group reminder every 2 minutes when enabled."""
+    """Send a configurable recurring group reminder and delete it after its duration."""
     while True:
-        time.sleep(50000)
+        try:
+            interval = int(get_setting("automsg_interval_seconds"))
+        except (TypeError, ValueError):
+            interval = 60
+        interval = max(10, min(interval, 86400))
+        time.sleep(interval)
+
         try:
             if not get_setting("automsg_enabled"):
                 continue
             if not GROUP_ID:
                 log.error("GROUP_ID is empty; skipping /mylink reminder")
                 continue
-            send(
+
+            result = send(
                 GROUP_ID,
-                "🚀 <b>PROMOTER 500 TON GIVEAWAY</b>\n"
-                "💎 Invite genuine friends and compete for prizes!\n"
+                "🚀 <b>PROMOTER 500 TON GIVEAWAY</b>\\n"
+                "💎 Invite genuine friends and compete for prizes!\\n"
                 "👇 Tap <b>/mylink</b> below to generate your personal invite link.",
                 parse_mode="HTML",
                 reply_markup=reminder_keyboard(),
             )
+            message_info = result.get("result") or {}
+            message_id = message_info.get("message_id")
+            if message_id:
+                try:
+                    duration = int(get_setting("automsg_duration_seconds"))
+                except (TypeError, ValueError):
+                    duration = 10
+                duration = max(1, min(duration, 86400))
+
+                def delete_reminder_later(chat_id=GROUP_ID, msg_id=message_id, delay=duration):
+                    try:
+                        time.sleep(delay)
+                        tg("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
+                    except Exception:
+                        log.exception("Could not auto-delete recurring reminder %s", msg_id)
+
+                threading.Thread(
+                    target=delete_reminder_later,
+                    name=f"reminder-delete-{message_id}",
+                    daemon=True,
+                ).start()
         except Exception:
             log.exception("Could not send recurring /mylink reminder")
 
