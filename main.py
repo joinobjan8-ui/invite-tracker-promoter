@@ -58,16 +58,97 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 _bot_username = None
 _http = requests.Session()
 
+# Telegram rate-limit protection. Per-chat pacing prevents bursts from commands
+# and the recurring reminder. Retries honor Telegram's retry_after parameter.
+_rate_lock = threading.Lock()
+_next_chat_request_at = {}
+CHAT_REQUEST_GAP = 3.2
+MAX_TG_ATTEMPTS = 6
+
+
+def _pace_chat(chat_id):
+    if chat_id is None:
+        return
+    key = str(chat_id)
+    with _rate_lock:
+        now = time.monotonic()
+        scheduled = _next_chat_request_at.get(key, 0.0)
+        _next_chat_request_at[key] = max(now, scheduled) + CHAT_REQUEST_GAP
+    wait = max(0.0, scheduled - now)
+    if wait:
+        time.sleep(wait)
+
 
 def tg(method, payload=None):
     if not API:
         raise RuntimeError("BOT_TOKEN is not configured")
-    response = _http.post(f"{API}/{method}", json=payload or {}, timeout=12)
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        log.error("Telegram API %s failed: %s", method, result)
-    return result
+
+    payload = payload or {}
+    chat_id = payload.get("chat_id")
+    last_error = None
+
+    for attempt in range(1, MAX_TG_ATTEMPTS + 1):
+        _pace_chat(chat_id)
+        try:
+            response = _http.post(
+                f"{API}/{method}", json=payload, timeout=(5, 20)
+            )
+            try:
+                result = response.json()
+            except ValueError:
+                result = {}
+
+            if response.status_code == 429:
+                params = result.get("parameters") or {}
+                retry_after = params.get("retry_after", 2)
+                try:
+                    retry_after = max(1, min(int(retry_after), 120))
+                except (TypeError, ValueError):
+                    retry_after = 2
+                if attempt >= MAX_TG_ATTEMPTS:
+                    log.error("Telegram rate limit persisted for %s after %s attempts", method, attempt)
+                    return {
+                        "ok": False,
+                        "error_code": 429,
+                        "description": result.get("description", "Too Many Requests"),
+                        "parameters": params,
+                    }
+                log.warning("Telegram rate limit for %s; retrying in %ss (attempt %s/%s)",
+                            method, retry_after, attempt, MAX_TG_ATTEMPTS)
+                time.sleep(retry_after)
+                continue
+
+            if response.status_code >= 500:
+                last_error = f"HTTP {response.status_code}"
+                if attempt < MAX_TG_ATTEMPTS:
+                    time.sleep(min(2 ** (attempt - 1), 15))
+                    continue
+
+            if not response.ok or not result.get("ok"):
+                log.error("Telegram API %s failed (HTTP %s): %s",
+                          method, response.status_code,
+                          result.get("description") or response.text[:300])
+                return result or {
+                    "ok": False,
+                    "error_code": response.status_code,
+                    "description": response.text[:300],
+                }
+            return result
+
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = str(exc)
+            if attempt < MAX_TG_ATTEMPTS:
+                delay = min(2 ** (attempt - 1), 15)
+                log.warning("Telegram network error for %s; retrying in %ss (attempt %s/%s)",
+                            method, delay, attempt, MAX_TG_ATTEMPTS)
+                time.sleep(delay)
+                continue
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            break
+
+    log.error("Telegram API %s exhausted retries: %s", method, last_error)
+    return {"ok": False, "description": str(last_error or "Telegram request failed")}
 
 
 def send(chat_id, text, **kwargs):
@@ -231,15 +312,15 @@ def get_inviter_display_name(inviter_id, chat_key):
 
 # Persistent owner-controlled switches (stored in MongoDB across restarts).
 DEFAULT_SETTINGS = {
-    "welcome_enabled": True,          # Welcome message visible in the group
+    "welcome_enabled": False,         # Start off to avoid welcome-message floods in busy groups
     "welcome_admin_enabled": False,   # Join notification sent to OWNER_ID privately
-    "automsg_enabled": True,
-    "automsg_interval_seconds": 60,  # Send reminder every 60 seconds
+    "automsg_enabled": False,  # Off by default to avoid Telegram flood limits; owner can enable it
+    "automsg_interval_seconds": 3600,  # Send reminder hourly when enabled
     "automsg_duration_seconds": 10,  # Delete reminder after 10 seconds
     "all_messages_enabled": True,
     "linkmedia_enabled": True,
     "autodelete_enabled": True,
-    "autodelete_seconds": 30,
+    "autodelete_seconds": 15,
 }
 
 def get_setting(key):
@@ -260,19 +341,26 @@ def set_setting(key, value):
         DEFAULT_SETTINGS[key] = value
 
 
-def send_auto_delete(chat_id, text, **kwargs):
-    """Send a message and schedule deletion for group replies when enabled."""
+def send_auto_delete(chat_id, text, delete_after=None, **kwargs):
+    """Send a message and schedule deletion for group replies when enabled.
+
+    delete_after overrides the configurable default delay for this message only.
+    """
     result = send(chat_id, text, **kwargs)
     chat = result.get("result", {}).get("chat", {})
     message_id = result.get("result", {}).get("message_id")
     # Private chats (including personal invite links) are intentionally not deleted.
     if (is_target_chat(chat) and chat.get("type") in ("group", "supergroup")
-            and message_id and get_setting("autodelete_enabled")):
+            and message_id
+            and (get_setting("autodelete_enabled") or delete_after is not None)):
         try:
-            delay = int(get_setting("autodelete_seconds"))
+            delay = int(
+                delete_after if delete_after is not None
+                else get_setting("autodelete_seconds")
+            )
         except (TypeError, ValueError):
-            delay = 30
-        delay = max(5, min(delay, 86400))
+            delay = 15
+        delay = max(1, min(delay, 86400))
 
         def delete_later():
             try:
@@ -288,6 +376,28 @@ def send_auto_delete(chat_id, text, **kwargs):
 def is_owner(user):
     return bool(OWNER_ID and str((user or {}).get("id", "")) == OWNER_ID)
 
+
+ADMIN_CONTROL_COMMANDS = {
+    "/help", "/owner",
+    "/welcome_on", "/welcome_off", "/welcome_all_on", "/welcome_all_off",
+    "/welcome_admin_on", "/welcome_admin_off",
+    "/automsg_on", "/automsg_off", "/automsg_interval", "/automsg_duration",
+    "/allmsg_on", "/allmsg_off", "/linkmedia_on", "/linkmedia_off",
+    "/autodelete_on", "/autodelete_off", "/autodelete_time",
+}
+
+def is_authorized_admin_command(text, user):
+    """Allow the configured owner OR a current admin of the target group to control settings."""
+    if is_owner(user):
+        return True
+    if not GROUP_ID or not user or not user.get("id"):
+        return False
+    command = text.split(maxsplit=1)[0].split("@")[0].lower() if text else ""
+    if command not in ADMIN_CONTROL_COMMANDS:
+        return False
+    # Check against the configured group even when an admin sends the command in private.
+    return user_is_group_admin(GROUP_ID, user["id"])
+
 def owner_help_text():
     return (
         "🛠 PROMOTER ADMIN COMMANDS\n\n"
@@ -300,7 +410,7 @@ def owner_help_text():
         "/welcome_admin_off — turn off private admin join notices\n"
         "/automsg_on — enable recurring group reminder\n"
         "/automsg_off — disable recurring group reminder\n"
-        "/automsg_interval 60 — set reminder interval in seconds (10–86400)\n"
+        "/automsg_interval 3600 — set reminder interval in seconds (300–86400)\n"
         "/automsg_duration 10 — set reminder visibility in seconds (1–86400)\n"
         "/allmsg_on — allow normal member messages\n"
         "/allmsg_off — delete all non-admin group messages\n"
@@ -308,7 +418,7 @@ def owner_help_text():
         "/linkmedia_off — disable link/media/button filter\n"
         "/autodelete_on — auto-delete bot replies to group /mylink and /topinviter\n"
         "/autodelete_off — disable auto-delete\n"
-        "/autodelete_time 30 — set auto-delete delay in seconds (5–86400)\n\n"
+        "/autodelete_time 15 — set auto-delete delay in seconds (5–86400)\n\n"
         f"Current settings: group_welcome={get_setting('welcome_enabled')}, "
         f"admin_join_notice={get_setting('welcome_admin_enabled')}, "
         f"autodelete={get_setting('autodelete_enabled')}, "
@@ -390,10 +500,11 @@ def moderate_group_message(message):
 
 def handle_message(message):
     text = (message.get("text") or "").strip()
-    # Owner controls are handled before moderation so /allmsg_off cannot lock owner out.
+    # Owner/admin controls run before moderation so /allmsg_off cannot lock them out.
+    # Admin status is verified against GROUP_ID, including when the command is sent privately.
     sender = message.get("from") or {}
     chat = message.get("chat") or {}
-    if text.startswith("/") and is_owner(sender):
+    if text.startswith("/") and is_authorized_admin_command(text, sender):
         owner_command = text.split(maxsplit=1)[0].split("@")[0].lower()
         setting_commands = {
             "/welcome_on": ("welcome_enabled", True, "Group welcome messages enabled."),
@@ -432,9 +543,9 @@ def handle_message(message):
                 if owner_command == "/automsg_interval"
                 else "automsg_duration_seconds"
             )
-            minimum = 10 if label == "interval" else 1
+            minimum = 300 if label == "interval" else 1
             if len(parts) != 2 or not parts[1].strip().isdigit():
-                example = "60" if label == "interval" else "10"
+                example = "3600" if label == "interval" else "10"
                 send(chat.get("id"), f"Usage: /automsg_{label} {example} (seconds)")
                 return
             seconds = int(parts[1].strip())
@@ -505,30 +616,45 @@ def handle_message(message):
         if chat_type == "private":
             send_personal_link(chat_id, sender)
             return
-        if not is_target_chat(chat):
+        # Process /mylink in groups where the bot is installed. The generated
+        # invite link still targets the configured GROUP_ID. This avoids a silent
+        # no-op if GROUP_ID is configured as a username/ID in a different format.
+        if chat_type not in ("group", "supergroup"):
             return
 
-        keyboard = private_start_keyboard()
-        if not keyboard:
-            send(chat_id, "❌ Bot username unavailable. Please try again shortly.")
-            return
-
+        # In the group, show this user's own tracked invite link directly.
+        link, error = make_invite_link(sender)
         username = sender.get("username")
         who = f"@{username}" if username else (sender.get("first_name") or "there")
+
+        if error:
+            send_auto_delete(
+                chat_id,
+                f"❌ {escape(str(who))}, I couldn't create your invite link. "
+                "Please ask an admin to check the bot's Manage Invite Links permission.",
+                parse_mode="HTML",
+                reply_to_message_id=message.get("message_id"),
+                delete_after=15,
+            )
+            return
+
         send_auto_delete(
             chat_id,
-            f"👋 {escape(str(who))}, tap below to open the bot and press START "
-            "to receive your personal invite link.\n\n"
-            "💎 500 TON GIVEAWAY • Up to 100 winners\n"
-            "🔗 Your link is unique to your account.",
+            f"🔗 <b>{escape(str(who))}, your personal invite link:</b>\n"
+            f"<code>{escape(link)}</code>\n\n"
+            "💎 Share it with genuine friends to join the 500 TON giveaway.\n"
+            "⏳ This message will be deleted in 15 seconds.",
             parse_mode="HTML",
-            reply_markup=keyboard,
+            reply_markup=private_link_keyboard(link),
             reply_to_message_id=message.get("message_id"),
+            delete_after=15,
         )
         return
 
     if command == "/topinviter":
-        if chat_type != "private" and not is_target_chat(chat):
+        # Keep the command responsive in the group where the bot receives it;
+        # referral totals are still calculated for configured GROUP_ID.
+        if chat_type not in ("private", "group", "supergroup"):
             return
         if db is None:
             send(chat_id, "⚠️ MongoDB is not configured.")
@@ -578,7 +704,14 @@ def handle_message(message):
         if chat_type == "private":
             send(chat_id, "\n".join(lines), parse_mode="HTML")
         else:
-            send_auto_delete(chat_id, "\n".join(lines), parse_mode="HTML")
+            lines.append("⏳ This leaderboard message will be deleted in 15 seconds.")
+            send_auto_delete(
+                chat_id,
+                "\n".join(lines),
+                parse_mode="HTML",
+                reply_to_message_id=message.get("message_id"),
+                delete_after=15,
+            )
 
 
 
@@ -723,7 +856,7 @@ def send_mylink_reminder():
             interval = int(get_setting("automsg_interval_seconds"))
         except (TypeError, ValueError):
             interval = 60
-        interval = max(10, min(interval, 86400))
+        interval = max(300, min(interval, 86400))
         time.sleep(interval)
 
         try:
@@ -917,15 +1050,29 @@ def handle_callback_query(callback):
 
 
 def process_update(update):
+    """Process one Telegram update and log enough context to diagnose silent replies."""
     try:
         if "message" in update:
-            handle_message(update["message"])
+            message = update["message"]
+            sender = message.get("from") or {}
+            chat = message.get("chat") or {}
+            text = (message.get("text") or "").strip()
+            # Do not log message contents or private user data; only command and IDs.
+            command = text.split(maxsplit=1)[0][:64] if text.startswith("/") else "<non-command>"
+            log.info("Processing message update=%s chat_id=%s chat_type=%s user_id=%s command=%s",
+                     update.get("update_id"), chat.get("id"), chat.get("type"),
+                     sender.get("id"), command)
+            handle_message(message)
         if "chat_member" in update:
             handle_chat_member(update["chat_member"])
         if "callback_query" in update:
-            handle_callback_query(update["callback_query"])
+            callback = update["callback_query"]
+            log.info("Processing callback update=%s data=%s user_id=%s",
+                     update.get("update_id"), callback.get("data"),
+                     (callback.get("from") or {}).get("id"))
+            handle_callback_query(callback)
     except Exception:
-        log.exception("Error processing Telegram update")
+        log.exception("Error processing Telegram update_id=%s", update.get("update_id"))
 
 
 
@@ -948,7 +1095,9 @@ def webhook():
 
     update = request.get_json(silent=True) or {}
 
-    # Acknowledge immediately; process Telegram API/MongoDB work in background.
+    # A 200 here only acknowledges receipt; processing continues in the background.
+    # Log update type so an empty/unsupported webhook payload is visible in Render logs.
+    log.info("Webhook received update_id=%s keys=%s", update.get("update_id"), list(update.keys()))
     try:
         executor.submit(process_update, update)
     except Exception:
