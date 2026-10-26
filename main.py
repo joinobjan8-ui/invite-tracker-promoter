@@ -239,7 +239,7 @@ DEFAULT_SETTINGS = {
     "all_messages_enabled": True,
     "linkmedia_enabled": True,
     "autodelete_enabled": True,
-    "autodelete_seconds": 30,
+    "autodelete_seconds": 15,
 }
 
 def get_setting(key):
@@ -260,19 +260,26 @@ def set_setting(key, value):
         DEFAULT_SETTINGS[key] = value
 
 
-def send_auto_delete(chat_id, text, **kwargs):
-    """Send a message and schedule deletion for group replies when enabled."""
+def send_auto_delete(chat_id, text, delete_after=None, **kwargs):
+    """Send a message and schedule deletion for group replies when enabled.
+
+    delete_after overrides the configurable default delay for this message only.
+    """
     result = send(chat_id, text, **kwargs)
     chat = result.get("result", {}).get("chat", {})
     message_id = result.get("result", {}).get("message_id")
     # Private chats (including personal invite links) are intentionally not deleted.
     if (is_target_chat(chat) and chat.get("type") in ("group", "supergroup")
-            and message_id and get_setting("autodelete_enabled")):
+            and message_id
+            and (get_setting("autodelete_enabled") or delete_after is not None)):
         try:
-            delay = int(get_setting("autodelete_seconds"))
+            delay = int(
+                delete_after if delete_after is not None
+                else get_setting("autodelete_seconds")
+            )
         except (TypeError, ValueError):
-            delay = 30
-        delay = max(5, min(delay, 86400))
+            delay = 15
+        delay = max(1, min(delay, 86400))
 
         def delete_later():
             try:
@@ -308,7 +315,7 @@ def owner_help_text():
         "/linkmedia_off — disable link/media/button filter\n"
         "/autodelete_on — auto-delete bot replies to group /mylink and /topinviter\n"
         "/autodelete_off — disable auto-delete\n"
-        "/autodelete_time 30 — set auto-delete delay in seconds (5–86400)\n\n"
+        "/autodelete_time 15 — set auto-delete delay in seconds (5–86400)\n\n"
         f"Current settings: group_welcome={get_setting('welcome_enabled')}, "
         f"admin_join_notice={get_setting('welcome_admin_enabled')}, "
         f"autodelete={get_setting('autodelete_enabled')}, "
@@ -508,22 +515,32 @@ def handle_message(message):
         if not is_target_chat(chat):
             return
 
-        keyboard = private_start_keyboard()
-        if not keyboard:
-            send(chat_id, "❌ Bot username unavailable. Please try again shortly.")
-            return
-
+        # In the group, show this user's own tracked invite link directly.
+        link, error = make_invite_link(sender)
         username = sender.get("username")
         who = f"@{username}" if username else (sender.get("first_name") or "there")
+
+        if error:
+            send_auto_delete(
+                chat_id,
+                f"❌ {escape(str(who))}, I couldn't create your invite link. "
+                "Please ask an admin to check the bot's Manage Invite Links permission.",
+                parse_mode="HTML",
+                reply_to_message_id=message.get("message_id"),
+                delete_after=15,
+            )
+            return
+
         send_auto_delete(
             chat_id,
-            f"👋 {escape(str(who))}, tap below to open the bot and press START "
-            "to receive your personal invite link.\n\n"
-            "💎 500 TON GIVEAWAY • Up to 100 winners\n"
-            "🔗 Your link is unique to your account.",
+            f"🔗 <b>{escape(str(who))}, your personal invite link:</b>\n"
+            f"<code>{escape(link)}</code>\n\n"
+            "💎 Share it with genuine friends to join the 500 TON giveaway.\n"
+            "⏳ This message will be deleted in 15 seconds.",
             parse_mode="HTML",
-            reply_markup=keyboard,
+            reply_markup=private_link_keyboard(link),
             reply_to_message_id=message.get("message_id"),
+            delete_after=15,
         )
         return
 
@@ -578,7 +595,14 @@ def handle_message(message):
         if chat_type == "private":
             send(chat_id, "\n".join(lines), parse_mode="HTML")
         else:
-            send_auto_delete(chat_id, "\n".join(lines), parse_mode="HTML")
+            lines.append("⏳ This leaderboard message will be deleted in 15 seconds.")
+            send_auto_delete(
+                chat_id,
+                "\n".join(lines),
+                parse_mode="HTML",
+                reply_to_message_id=message.get("message_id"),
+                delete_after=15,
+            )
 
 
 
