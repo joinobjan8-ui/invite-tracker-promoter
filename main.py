@@ -62,7 +62,7 @@ _http = requests.Session()
 # and the recurring reminder. Retries honor Telegram's retry_after parameter.
 _rate_lock = threading.Lock()
 _next_chat_request_at = {}
-CHAT_REQUEST_GAP = 1.1
+CHAT_REQUEST_GAP = 3.2
 MAX_TG_ATTEMPTS = 6
 
 
@@ -311,7 +311,7 @@ def get_inviter_display_name(inviter_id, chat_key):
 
 # Persistent owner-controlled switches (stored in MongoDB across restarts).
 DEFAULT_SETTINGS = {
-    "welcome_enabled": True,          # Welcome message visible in the group
+    "welcome_enabled": False,         # Start off to avoid welcome-message floods in busy groups
     "welcome_admin_enabled": False,   # Join notification sent to OWNER_ID privately
     "automsg_enabled": True,
     "automsg_interval_seconds": 3600,  # Send reminder hourly by default
@@ -1044,15 +1044,29 @@ def handle_callback_query(callback):
 
 
 def process_update(update):
+    """Process one Telegram update and log enough context to diagnose silent replies."""
     try:
         if "message" in update:
-            handle_message(update["message"])
+            message = update["message"]
+            sender = message.get("from") or {}
+            chat = message.get("chat") or {}
+            text = (message.get("text") or "").strip()
+            # Do not log message contents or private user data; only command and IDs.
+            command = text.split(maxsplit=1)[0][:64] if text.startswith("/") else "<non-command>"
+            log.info("Processing message update=%s chat_id=%s chat_type=%s user_id=%s command=%s",
+                     update.get("update_id"), chat.get("id"), chat.get("type"),
+                     sender.get("id"), command)
+            handle_message(message)
         if "chat_member" in update:
             handle_chat_member(update["chat_member"])
         if "callback_query" in update:
-            handle_callback_query(update["callback_query"])
+            callback = update["callback_query"]
+            log.info("Processing callback update=%s data=%s user_id=%s",
+                     update.get("update_id"), callback.get("data"),
+                     (callback.get("from") or {}).get("id"))
+            handle_callback_query(callback)
     except Exception:
-        log.exception("Error processing Telegram update")
+        log.exception("Error processing Telegram update_id=%s", update.get("update_id"))
 
 
 
@@ -1075,7 +1089,9 @@ def webhook():
 
     update = request.get_json(silent=True) or {}
 
-    # Acknowledge immediately; process Telegram API/MongoDB work in background.
+    # A 200 here only acknowledges receipt; processing continues in the background.
+    # Log update type so an empty/unsupported webhook payload is visible in Render logs.
+    log.info("Webhook received update_id=%s keys=%s", update.get("update_id"), list(update.keys()))
     try:
         executor.submit(process_update, update)
     except Exception:
