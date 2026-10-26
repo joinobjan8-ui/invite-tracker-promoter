@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: promoter-invite-tracker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # ONE worker (so reminders/scheduler run once) with many threads (fast parallel handling)
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --worker-class gthread --threads 16 --timeout 120 --keep-alive 5
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.4
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROUP_ID
+        value: "@Promoter0007"
+      - key: MONGODB_URI
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: DB_NAME
+        value: promoter_giveaway
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: KEEPALIVE_SECONDS
+        value: "300"
+      - key: LINK_COOLDOWN_SECONDS
+        value: "3"
+      - key: TOP_N
+        value: "5"
