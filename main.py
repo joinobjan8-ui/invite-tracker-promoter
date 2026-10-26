@@ -375,6 +375,28 @@ def send_auto_delete(chat_id, text, delete_after=None, **kwargs):
 def is_owner(user):
     return bool(OWNER_ID and str((user or {}).get("id", "")) == OWNER_ID)
 
+
+ADMIN_CONTROL_COMMANDS = {
+    "/help", "/owner",
+    "/welcome_on", "/welcome_off", "/welcome_all_on", "/welcome_all_off",
+    "/welcome_admin_on", "/welcome_admin_off",
+    "/automsg_on", "/automsg_off", "/automsg_interval", "/automsg_duration",
+    "/allmsg_on", "/allmsg_off", "/linkmedia_on", "/linkmedia_off",
+    "/autodelete_on", "/autodelete_off", "/autodelete_time",
+}
+
+def is_authorized_admin_command(text, user):
+    """Allow the configured owner OR a current admin of the target group to control settings."""
+    if is_owner(user):
+        return True
+    if not GROUP_ID or not user or not user.get("id"):
+        return False
+    command = text.split(maxsplit=1)[0].split("@")[0].lower() if text else ""
+    if command not in ADMIN_CONTROL_COMMANDS:
+        return False
+    # Check against the configured group even when an admin sends the command in private.
+    return user_is_group_admin(GROUP_ID, user["id"])
+
 def owner_help_text():
     return (
         "🛠 PROMOTER ADMIN COMMANDS\n\n"
@@ -477,10 +499,11 @@ def moderate_group_message(message):
 
 def handle_message(message):
     text = (message.get("text") or "").strip()
-    # Owner controls are handled before moderation so /allmsg_off cannot lock owner out.
+    # Owner/admin controls run before moderation so /allmsg_off cannot lock them out.
+    # Admin status is verified against GROUP_ID, including when the command is sent privately.
     sender = message.get("from") or {}
     chat = message.get("chat") or {}
-    if text.startswith("/") and is_owner(sender):
+    if text.startswith("/") and is_authorized_admin_command(text, sender):
         owner_command = text.split(maxsplit=1)[0].split("@")[0].lower()
         setting_commands = {
             "/welcome_on": ("welcome_enabled", True, "Group welcome messages enabled."),
