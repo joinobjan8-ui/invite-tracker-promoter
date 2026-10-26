@@ -58,16 +58,96 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 _bot_username = None
 _http = requests.Session()
 
+# Telegram rate-limit protection. Per-chat pacing prevents bursts from commands
+# and the recurring reminder. Retries honor Telegram's retry_after parameter.
+_rate_lock = threading.Lock()
+_next_chat_request_at = {}
+CHAT_REQUEST_GAP = 1.1
+MAX_TG_ATTEMPTS = 6
+
+
+def _pace_chat(chat_id):
+    if chat_id is None:
+        return
+    key = str(chat_id)
+    with _rate_lock:
+        now = time.monotonic()
+        wait = max(0.0, _next_chat_request_at.get(key, 0.0) - now)
+        if wait:
+            time.sleep(wait)
+        _next_chat_request_at[key] = time.monotonic() + CHAT_REQUEST_GAP
+
 
 def tg(method, payload=None):
     if not API:
         raise RuntimeError("BOT_TOKEN is not configured")
-    response = _http.post(f"{API}/{method}", json=payload or {}, timeout=12)
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        log.error("Telegram API %s failed: %s", method, result)
-    return result
+
+    payload = payload or {}
+    chat_id = payload.get("chat_id")
+    last_error = None
+
+    for attempt in range(1, MAX_TG_ATTEMPTS + 1):
+        _pace_chat(chat_id)
+        try:
+            response = _http.post(
+                f"{API}/{method}", json=payload, timeout=(5, 20)
+            )
+            try:
+                result = response.json()
+            except ValueError:
+                result = {}
+
+            if response.status_code == 429:
+                params = result.get("parameters") or {}
+                retry_after = params.get("retry_after", 2)
+                try:
+                    retry_after = max(1, min(int(retry_after), 120))
+                except (TypeError, ValueError):
+                    retry_after = 2
+                if attempt >= MAX_TG_ATTEMPTS:
+                    log.error("Telegram rate limit persisted for %s after %s attempts", method, attempt)
+                    return {
+                        "ok": False,
+                        "error_code": 429,
+                        "description": result.get("description", "Too Many Requests"),
+                        "parameters": params,
+                    }
+                log.warning("Telegram rate limit for %s; retrying in %ss (attempt %s/%s)",
+                            method, retry_after, attempt, MAX_TG_ATTEMPTS)
+                time.sleep(retry_after)
+                continue
+
+            if response.status_code >= 500:
+                last_error = f"HTTP {response.status_code}"
+                if attempt < MAX_TG_ATTEMPTS:
+                    time.sleep(min(2 ** (attempt - 1), 15))
+                    continue
+
+            if not response.ok or not result.get("ok"):
+                log.error("Telegram API %s failed (HTTP %s): %s",
+                          method, response.status_code,
+                          result.get("description") or response.text[:300])
+                return result or {
+                    "ok": False,
+                    "error_code": response.status_code,
+                    "description": response.text[:300],
+                }
+            return result
+
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = str(exc)
+            if attempt < MAX_TG_ATTEMPTS:
+                delay = min(2 ** (attempt - 1), 15)
+                log.warning("Telegram network error for %s; retrying in %ss (attempt %s/%s)",
+                            method, delay, attempt, MAX_TG_ATTEMPTS)
+                time.sleep(delay)
+                continue
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            break
+
+    log.error("Telegram API %s exhausted retries: %s", method, last_error)
+    return {"ok": False, "description": str(last_error or "Telegram request failed")}
 
 
 def send(chat_id, text, **kwargs):
@@ -234,7 +314,7 @@ DEFAULT_SETTINGS = {
     "welcome_enabled": True,          # Welcome message visible in the group
     "welcome_admin_enabled": False,   # Join notification sent to OWNER_ID privately
     "automsg_enabled": True,
-    "automsg_interval_seconds": 60,  # Send reminder every 60 seconds
+    "automsg_interval_seconds": 3600,  # Send reminder hourly by default
     "automsg_duration_seconds": 10,  # Delete reminder after 10 seconds
     "all_messages_enabled": True,
     "linkmedia_enabled": True,
@@ -307,7 +387,7 @@ def owner_help_text():
         "/welcome_admin_off — turn off private admin join notices\n"
         "/automsg_on — enable recurring group reminder\n"
         "/automsg_off — disable recurring group reminder\n"
-        "/automsg_interval 60 — set reminder interval in seconds (10–86400)\n"
+        "/automsg_interval 3600 — set reminder interval in seconds (300–86400)\n"
         "/automsg_duration 10 — set reminder visibility in seconds (1–86400)\n"
         "/allmsg_on — allow normal member messages\n"
         "/allmsg_off — delete all non-admin group messages\n"
@@ -439,9 +519,9 @@ def handle_message(message):
                 if owner_command == "/automsg_interval"
                 else "automsg_duration_seconds"
             )
-            minimum = 10 if label == "interval" else 1
+            minimum = 300 if label == "interval" else 1
             if len(parts) != 2 or not parts[1].strip().isdigit():
-                example = "60" if label == "interval" else "10"
+                example = "3600" if label == "interval" else "10"
                 send(chat.get("id"), f"Usage: /automsg_{label} {example} (seconds)")
                 return
             seconds = int(parts[1].strip())
@@ -747,7 +827,7 @@ def send_mylink_reminder():
             interval = int(get_setting("automsg_interval_seconds"))
         except (TypeError, ValueError):
             interval = 60
-        interval = max(10, min(interval, 86400))
+        interval = max(300, min(interval, 86400))
         time.sleep(interval)
 
         try:
